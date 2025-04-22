@@ -41,7 +41,7 @@ logprobs_max = 5
 default_draft_amount = 8
 default_ttsmaxlen = 4096
 default_visionmaxres = 1024
-net_save_slots = 8
+net_save_slots = 10
 
 # abuse prevention
 stop_token_max = 256
@@ -50,7 +50,7 @@ logit_bias_max = 512
 dry_seq_break_max = 128
 
 # global vars
-KcppVersion = "1.88.yr0-ROCm"
+KcppVersion = "1.89.yr0-ROCm"
 showdebug = True
 kcpp_instance = None #global running instance
 global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False}
@@ -180,6 +180,8 @@ class load_model_inputs(ctypes.Structure):
                 ("rope_freq_base", ctypes.c_float),
                 ("moe_experts", ctypes.c_int),
                 ("no_bos_token", ctypes.c_bool),
+                ("override_kv", ctypes.c_char_p),
+                ("override_tensors", ctypes.c_char_p),
                 ("flash_attention", ctypes.c_bool),
                 ("tensor_split", ctypes.c_float * tensor_split_max),
                 ("quant_k", ctypes.c_int),
@@ -1017,7 +1019,8 @@ def autoset_gpu_layers(ctxsize,sdquanted,bbs): #shitty algo to determine how man
 def fetch_gpu_properties(testCL,testCU,testVK):
     import subprocess
 
-    gpumem_ignore_limit = 1024*1024*600
+    gpumem_ignore_limit_min = 1024*1024*600 #600 mb min
+    gpumem_ignore_limit_max = 1024*1024*1024*300 #300 gb max
 
     if testCU:
         FetchedCUdevices = []
@@ -1114,7 +1117,7 @@ def fetch_gpu_properties(testCL,testCU,testVK):
                             match = re.search(r"size\s*=\s*(\d+)", snippet)
                             if match:
                                 dmem = int(match.group(1))
-                                if dmem > gpumem_ignore_limit:
+                                if dmem > gpumem_ignore_limit_min and dmem < gpumem_ignore_limit_max:
                                     lowestvkmem = dmem if lowestvkmem==0 else (dmem if dmem<lowestvkmem else lowestvkmem)
                         gpuidx += 1
                 except Exception: # failed to get vulkan vram
@@ -1145,13 +1148,17 @@ def fetch_gpu_properties(testCL,testCU,testVK):
                     idx = plat+dev*2
                     if idx<len(CLDevices):
                         CLDevicesNames[idx] = dname
-                        if dmem > gpumem_ignore_limit:
+                        if dmem > gpumem_ignore_limit_min and dmem < gpumem_ignore_limit_max:
                             lowestclmem = dmem if lowestclmem==0 else (dmem if dmem<lowestclmem else lowestclmem)
                     dev += 1
                 plat += 1
             MaxMemory[0] = max(lowestclmem,MaxMemory[0])
         except Exception:
             pass
+    if MaxMemory[0]>0:
+        print(f"Detected Free GPU Memory: {int(MaxMemory[0]/1024/1024)} MB (Set GPU layers manually if incorrect)")
+    else:
+        print("Unable to determine GPU Memory")
     return
 
 def auto_set_backend_cli():
@@ -1233,6 +1240,8 @@ def load_model(model_filename):
 
     inputs.moe_experts = args.moeexperts
     inputs.no_bos_token = args.nobostoken
+    inputs.override_kv = args.overridekv.encode("UTF-8") if args.overridekv else "".encode("UTF-8")
+    inputs.override_tensors = args.overridetensors.encode("UTF-8") if args.overridetensors else "".encode("UTF-8")
     inputs = set_backend_props(inputs)
     ret = handle.load_model(inputs)
     return ret
@@ -2564,13 +2573,39 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         reply = ""
         status = str(parsed_dict['status'][0]) if 'status' in parsed_dict else "Ready To Generate"
         prompt = str(parsed_dict['prompt'][0]) if 'prompt' in parsed_dict else ""
+        chatmsg = str(parsed_dict['chatmsg'][0]) if 'chatmsg' in parsed_dict else ""
+        imgprompt = str(parsed_dict['imgprompt'][0]) if 'imgprompt' in parsed_dict else ""
         max_length = int(parsed_dict['max_length'][0]) if 'max_length' in parsed_dict else 100
         temperature = float(parsed_dict['temperature'][0]) if 'temperature' in parsed_dict else 0.75
         top_k = int(parsed_dict['top_k'][0]) if 'top_k' in parsed_dict else 100
         top_p = float(parsed_dict['top_p'][0]) if 'top_p' in parsed_dict else 0.9
         rep_pen = float(parsed_dict['rep_pen'][0]) if 'rep_pen' in parsed_dict else 1.0
         ban_eos_token = int(parsed_dict['ban_eos_token'][0]) if 'ban_eos_token' in parsed_dict else 0
-        gencommand = (parsed_dict['generate'][0] if 'generate' in parsed_dict else "")=="Generate"
+        steps = int(parsed_dict['steps'][0]) if 'steps' in parsed_dict else 25
+        cfg = int(parsed_dict['cfg'][0]) if 'cfg' in parsed_dict else 7
+        genbtnval = (parsed_dict['generate'][0] if 'generate' in parsed_dict else "")
+        gencommand = (genbtnval=="Generate" or genbtnval=="Send")
+        chatmode = int(parsed_dict['chatmode'][0]) if 'chatmode' in parsed_dict else 0
+        imgmode = int(parsed_dict['imgmode'][0]) if 'imgmode' in parsed_dict else 0
+        human_name = str(parsed_dict['human_name'][0]) if 'human_name' in parsed_dict else "User"
+        bot_name = str(parsed_dict['bot_name'][0]) if 'bot_name' in parsed_dict else "Assistant"
+        stops = []
+        prefix = ""
+        if chatmode:
+            ban_eos_token = False
+            prompt = prompt.replace("1HdNl1","\n")
+            if chatmsg:
+                prompt += f"\n{human_name}: {chatmsg}\n{bot_name}:"
+            else:
+                gencommand = False
+            stops = [f"\n{human_name}:",f"\n{bot_name}:"]
+            prefix = f"[This is a chat conversation log between {human_name} and {bot_name}.]\n"
+        elif imgmode:
+            if imgprompt:
+                prompt = imgprompt
+                max_length = 1
+            else:
+                gencommand = False
 
         if modelbusy.locked():
             status = "Model is currently busy, try again later."
@@ -2584,23 +2619,79 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 epurl = f"{httpsaffix}://localhost:{args.port}"
                 if args.host!="":
                     epurl = f"{httpsaffix}://{args.host}:{args.port}"
-                gen_payload = {"prompt": prompt,"max_length": max_length,"temperature": temperature,"top_k": top_k,"top_p": top_p,"rep_pen": rep_pen,"ban_eos_token":ban_eos_token}
-                respjson = make_url_request(f'{epurl}/api/v1/generate', gen_payload)
-                reply = html.escape(respjson["results"][0]["text"])
+                if imgmode and imgprompt:
+                    gen_payload = {"prompt":{"3":{"inputs":{"cfg":cfg,"steps":steps}},"6":{"inputs":{"text":imgprompt}}}}
+                    respjson = make_url_request(f'{epurl}/prompt', gen_payload)
+                else:
+                    gen_payload = {"prompt": prefix+prompt,"max_length": max_length,"temperature": temperature,"top_k": top_k,"top_p": top_p,"rep_pen": rep_pen,"ban_eos_token":ban_eos_token, "stop_sequence":stops}
+                    respjson = make_url_request(f'{epurl}/api/v1/generate', gen_payload)
+                    reply = html.escape(respjson["results"][0]["text"])
+                    if chatmode:
+                        reply = " "+reply.strip()
                 status = "Generation Completed"
 
             if "generate" in parsed_dict:
                 del parsed_dict["generate"]
+            if "chatmsg" in parsed_dict:
+                del parsed_dict["chatmsg"]
+            if "imgprompt" in parsed_dict:
+                del parsed_dict["imgprompt"]
             parsed_dict["prompt"] = prompt + reply
             parsed_dict["status"] = status
+            parsed_dict["chatmode"] = ("1" if chatmode else "0")
+            parsed_dict["imgmode"] = ("1" if imgmode else "0")
             updated_query_string = urlparse.urlencode(parsed_dict, doseq=True)
             updated_path = parsed_url._replace(query=updated_query_string).geturl()
             self.path = updated_path
+            time.sleep(0.2) #short delay
             self.send_response(302)
             self.send_header("location", self.path)
             self.end_headers(content_type='text/html')
             return
 
+        imgbtn = '''<form action="/noscript" style="display: inline;">
+        <input type="hidden" name="imgmode" value="1">
+        <input type="submit" value="Image Mode">
+        </form>'''
+
+        bodycontent = f'''<b><u>{"Image Mode" if imgmode else ("Chat Mode" if chatmode else "Story Mode")}</u></b><br>'''
+        optionscontent = ""
+        if imgmode:
+            bodycontent += f'''<p>Generated Image: {prompt if prompt else "None"}</p>
+            {'<img src="view.png" width="320" width="320">' if prompt else ""}<br>
+            <label>Image Prompt: </label><input type="text" size="40" value="" name="imgprompt">
+            <input type="hidden" name="generate" value="Generate" />
+            <input type="submit" value="Generate"> (Be patient)'''
+        elif chatmode:
+            oldconvo = prompt.strip().replace(f"{human_name}:",f"<b>{human_name}:</b>").replace(f"{bot_name}:",f"<b>{bot_name}:</b>").replace("\n","<br>")
+            oldconvo += f'''<input type="hidden" name="human_name" value="{human_name}"><input type="hidden" name="bot_name" value="{bot_name}">'''
+            newconvo = '''Start a new conversation.<br>
+            <label>Your Name: </label> <input type="text" size="10" value="User" name="human_name"><br>
+            <label>Bot Name: </label> <input type="text" size="10" value="Assistant" name="bot_name"><br>'''
+            clnprompt = prompt.replace("\n","1HdNl1")
+            bodycontent += f'''<p>{newconvo if prompt=="" else oldconvo}</p>
+            <input type="hidden" name="prompt" value="{clnprompt}">
+            <label>Say: </label><input type="text" size="40" value="" name="chatmsg">
+            <input type="hidden" name="generate" value="Send" />
+            <input type="submit" value="Send"> (Be patient)'''
+        else:
+            bodycontent += f'''
+<textarea name="prompt" cols="60" rows="8" wrap="soft" placeholder="Enter Prompt Here">{prompt}</textarea><br>
+<input type="hidden" name="generate" value="Generate" />
+<input type="submit" value="Generate"> (Be patient)
+'''
+        if not imgmode:
+            optionscontent = f'''<label>Gen. Amount</label> <input type="text" size="4" value="{max_length}" name="max_length"><br>
+            <label>Temperature</label> <input type="text" size="4" value="{temperature}" name="temperature"><br>
+            <label>Top-K</label> <input type="text" size="4" value="{top_k}" name="top_k"><br>
+            <label>Top-P</label> <input type="text" size="4" value="{top_p}" name="top_p"><br>
+            <label>Rep. Pen</label> <input type="text" size="4" value="{rep_pen}" name="rep_pen"><br>
+            <label>Prevent EOS</label> <input type="checkbox" name="ban_eos_token" value="1" {"checked" if ban_eos_token else ""}><br>'''
+        else:
+            optionscontent = f'''<label>Steps</label> <input type="text" size="4" value="{steps}" name="steps"><br>
+            <label>Cfg. Scale</label> <input type="text" size="4" value="{cfg}" name="cfg"><br>'''
+
+        caps = get_capabilities()
         finalhtml = f'''<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -2611,22 +2702,26 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 <p>KoboldCpp can be used without Javascript enabled, however this is not recommended.
 <br>If you have Javascript, please use <a href="/">KoboldAI Lite WebUI</a> instead.</p><hr>
 <form action="/noscript">
-Enter Prompt:<br>
-<textarea name="prompt" cols="60" rows="8" wrap="soft" placeholder="Enter Prompt Here">{prompt}</textarea>
+{bodycontent}
 <hr>
 <b>{status}</b><br>
 <hr>
-<label>Gen. Amount</label> <input type="text" size="4" value="{max_length}" name="max_length"><br>
-<label>Temperature</label> <input type="text" size="4" value="{temperature}" name="temperature"><br>
-<label>Top-K</label> <input type="text" size="4" value="{top_k}" name="top_k"><br>
-<label>Top-P</label> <input type="text" size="4" value="{top_p}" name="top_p"><br>
-<label>Rep. Pen</label> <input type="text" size="4" value="{rep_pen}" name="rep_pen"><br>
-<label>Prevent EOS</label> <input type="checkbox" name="ban_eos_token" value="1" {"checked" if ban_eos_token else ""}><br>
-<input type="submit" name="generate" value="Generate"> (Please be patient)
+{optionscontent}
+<input type="hidden" name="chatmode" value="{chatmode}">
+<input type="hidden" name="imgmode" value="{imgmode}">
 </form>
-<form action="/noscript">
-<input type="submit" value="Reset">
+<hr>
+<div style="display: inline-block;">
+Change Mode<br>
+<form action="/noscript" style="display: inline;">
+<input type="submit" value="Story Mode">
 </form>
+<form action="/noscript" style="display: inline;">
+<input type="hidden" name="chatmode" value="1">
+<input type="submit" value="Chat Mode">
+</form>
+{imgbtn if ("txt2img" in caps and caps["txt2img"]) else ""}
+</div>
 </div>
 </body></html>'''
         finalhtml = finalhtml.encode('utf-8')
@@ -2765,7 +2860,7 @@ Enter Prompt:<br>
                 response_body = (json.dumps([]).encode())
             else:
                 response_body = (json.dumps([friendlysdmodelname]).encode())
-        elif self.path=='/view' or self.path=='/api/view' or self.path.startswith('/view?') or self.path.startswith('/api/view?'): #emulate comfyui
+        elif self.path=='/view' or self.path=='/view.png' or self.path=='/api/view' or self.path.startswith('/view?') or self.path.startswith('/api/view?'): #emulate comfyui
             content_type = 'image/png'
             response_body = lastgeneratedcomfyimg
         elif self.path=='/history' or self.path=='/api/history' or self.path.startswith('/api/history/') or self.path.startswith('/history/'): #emulate comfyui
@@ -3525,9 +3620,9 @@ def zenity(filetypes=None, initialdir="", initialfile="", **kwargs) -> Tuple[int
         raise Exception("Zenity disabled, attempting to use TK GUI.")
     if sys.platform != "linux":
         raise Exception("Zenity GUI is only usable on Linux, attempting to use TK GUI.")
-    zenity_bin = shutil.which("zenity")
+    zenity_bin = shutil.which("yad")
     if not zenity_bin:
-        zenity_bin = shutil.which("yad")
+        zenity_bin = shutil.which("zenity")
     if not zenity_bin:
         raise Exception("Zenity not present, falling back to TK GUI.")
 
@@ -3535,6 +3630,20 @@ def zenity(filetypes=None, initialdir="", initialfile="", **kwargs) -> Tuple[int
         return txt.replace("\\", "\\\\").replace("$", "\\$").replace("!", "\\!").replace("*", "\\*")\
         .replace("?", "\\?").replace("&", "&amp;").replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")\
         .replace("(", "\\(").replace(")", "\\)").replace("[", "\\[").replace("]", "\\]").replace("{", "\\{").replace("}", "\\}")
+
+    def zenity_sanity_check(): #make sure zenity is sane
+        nonlocal zenity_bin
+        try: # Run `zenity --help` and pipe to grep
+            result = subprocess.run(f"{zenity_bin} --help | grep Usage", shell=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
+            if result.returncode == 0 and "Usage" in result.stdout:
+                return True
+            else:
+                return False
+        except FileNotFoundError:
+            return False
+
+    if not zenity_sanity_check():
+        raise Exception("Zenity not working correctly, falling back to TK GUI.")
 
     # Build args based on keywords
     args = ['/usr/bin/env', zenity_bin, '--file-selection']
@@ -3589,15 +3698,6 @@ def zentk_askopenfilename(**options):
     except Exception:
         from tkinter.filedialog import askopenfilename
         result = askopenfilename(**options)
-    return result
-
-def zentk_askopenmultiplefilenames(**options):
-    try:
-        files = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), title=options.get("title"), multiple=True, separator="\n")[1].splitlines()
-        result = tuple(filter(os.path.isfile, files))
-    except Exception:
-        from tkinter.filedialog import askopenfilenames
-        result = askopenfilenames(**options)
     return result
 
 def zentk_askdirectory(**options):
@@ -3699,7 +3799,6 @@ def show_gui():
                     toggleflashattn(1,1,1)
                     togglectxshift(1,1,1)
                     togglehorde(1,1,1)
-                    togglesdquant(1,1,1)
                     toggletaesd(1,1,1)
                     tabbuttonaction(tabnames[curr_tab_idx])
 
@@ -3811,6 +3910,8 @@ def show_gui():
     moeexperts_var = ctk.StringVar(value=str(-1))
     defaultgenamt_var = ctk.StringVar(value=str(512))
     nobostoken_var = ctk.IntVar(value=0)
+    override_kv_var = ctk.StringVar(value="")
+    override_tensors_var = ctk.StringVar(value="")
 
     model_var = ctk.StringVar()
     lora_var = ctk.StringVar()
@@ -4220,7 +4321,7 @@ def show_gui():
         changed_gpu_choice_var()
 
     def on_picked_model_file(filepath):
-        if filepath.lower().endswith('.kcpps') or filepath.lower().endswith('.kcppt'):
+        if filepath and (filepath.lower().endswith('.kcpps') or filepath.lower().endswith('.kcppt')):
             #load it as a config file instead
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 dict = json.load(f)
@@ -4545,7 +4646,9 @@ def show_gui():
     qkvslider,qkvlabel,qkvtitle = makeslider(tokens_tab, "Quantize KV Cache:", quantkv_text, quantkv_var, 0, 2, 30, set=0,tooltip="Enable quantization of KV cache.\nRequires FlashAttention for full effect, otherwise only K cache is quantized.")
     quantkv_var.trace("w", toggleflashattn)
     makecheckbox(tokens_tab, "No BOS Token", nobostoken_var, 43, tooltiptxt="Prevents BOS token from being added at the start of any prompt. Usually NOT recommended for most models.")
-    makelabelentry(tokens_tab, "MoE Experts:", moeexperts_var, row=45, padx=100, singleline=True, tooltip="Override number of MoE experts.")
+    makelabelentry(tokens_tab, "MoE Experts:", moeexperts_var, row=45, padx=120, singleline=True, tooltip="Override number of MoE experts.")
+    makelabelentry(tokens_tab, "Override KV:", override_kv_var, row=47, padx=120, singleline=True, width=150, tooltip="Advanced option to override model metadata by key, same as in llama.cpp. Mainly for debugging, not intended for general use. Types: int, float, bool, str")
+    makelabelentry(tokens_tab, "Override Tensors:", override_tensors_var, row=49, padx=120, singleline=True, width=150, tooltip="Advanced option to override tensor backend selection, same as in llama.cpp.")
 
     # Model Tab
     model_tab = tabcontent["Loaded Files"]
@@ -4632,23 +4735,10 @@ def show_gui():
     makelabelentry(images_tab, "Image Threads:" , sd_threads_var, 6, 50,padx=290,singleline=True,tooltip="How many threads to use during image generation.\nIf left blank, uses same value as threads.")
     sd_model_var.trace("w", gui_changed_modelfile)
 
-    sdloritem1,sdloritem2,sdloritem3 = makefileentry(images_tab, "Image LoRA (Must be non-quant):", "Select SD lora file",sd_lora_var, 10, width=280, singlecol=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded.")
-    sdloritem4,sdloritem5 = makelabelentry(images_tab, "Image LoRA Multiplier:" , sd_loramult_var, 12, 50,padx=290,singleline=True,tooltip="What mutiplier value to apply the SD LoRA with.")
-    def togglesdquant(a,b,c):
-        if sd_quant_var.get()==1:
-            sdloritem1.grid_remove()
-            sdloritem2.grid_remove()
-            sdloritem3.grid_remove()
-            sdloritem4.grid_remove()
-            sdloritem5.grid_remove()
-        else:
-            if not sdloritem1.grid_info() or not sdloritem2.grid_info() or not sdloritem3.grid_info() or not sdloritem4.grid_info() or not sdloritem5.grid_info():
-                sdloritem1.grid()
-                sdloritem2.grid()
-                sdloritem3.grid()
-                sdloritem4.grid()
-                sdloritem5.grid()
-    makecheckbox(images_tab, "Compress Weights (Saves Memory)", sd_quant_var, 8,command=togglesdquant,tooltiptxt="Quantizes the SD model weights to save memory. May degrade quality.")
+    makefileentry(images_tab, "Image LoRA (safetensors/gguf):", "Select SD lora file",sd_lora_var, 10, width=280, singlecol=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded. Should be unquantized!")
+    makelabelentry(images_tab, "Image LoRA Multiplier:" , sd_loramult_var, 12, 50,padx=290,singleline=True,tooltip="What mutiplier value to apply the SD LoRA with.")
+
+    makecheckbox(images_tab, "Compress Weights (Saves Memory)", sd_quant_var, 8,tooltiptxt="Quantizes the SD model weights to save memory. May degrade quality.")
     sd_quant_var.trace("w", changed_gpulayers_estimate)
 
     makefileentry(images_tab, "T5-XXL File:", "Select Optional T5-XXL model file (SD3 or flux)",sd_t5xxl_var, 14, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
@@ -4838,6 +4928,8 @@ def show_gui():
         args.moeexperts = int(moeexperts_var.get()) if moeexperts_var.get()!="" else -1
         args.defaultgenamt = int(defaultgenamt_var.get()) if defaultgenamt_var.get()!="" else 512
         args.nobostoken = (nobostoken_var.get()==1)
+        args.overridekv = None if override_kv_var.get() == "" else override_kv_var.get()
+        args.overridetensors = None if override_tensors_var.get() == "" else override_tensors_var.get()
         args.chatcompletionsadapter = None if chatcompletionsadapter_var.get() == "" else chatcompletionsadapter_var.get()
         try:
             if kcpp_exporting_template and isinstance(args.chatcompletionsadapter, str) and args.chatcompletionsadapter!="" and os.path.exists(args.chatcompletionsadapter):
@@ -4904,13 +4996,11 @@ def show_gui():
             args.sdclipg = sd_clipg_var.get()
         if sd_quant_var.get()==1:
             args.sdquant = True
-            args.sdlora = ""
+        if sd_lora_var.get() != "":
+            args.sdlora = sd_lora_var.get()
+            args.sdloramult = float(sd_loramult_var.get())
         else:
-            if sd_lora_var.get() != "":
-                args.sdlora = sd_lora_var.get()
-                args.sdloramult = float(sd_loramult_var.get())
-            else:
-                args.sdlora = ""
+            args.sdlora = ""
 
         if whisper_model_var.get() != "":
             args.whispermodel = whisper_model_var.get()
@@ -5033,6 +5123,10 @@ def show_gui():
         if "defaultgenamt" in dict and dict["defaultgenamt"]:
             defaultgenamt_var.set(dict["defaultgenamt"])
         nobostoken_var.set(dict["nobostoken"] if ("nobostoken" in dict) else 0)
+        if "overridekv" in dict and dict["overridekv"]:
+            override_kv_var.set(dict["overridekv"])
+        if "overridetensors" in dict and dict["overridetensors"]:
+            override_tensors_var.set(dict["overridetensors"])
 
         if "blasbatchsize" in dict and dict["blasbatchsize"]:
             blas_size_var.set(blasbatchsize_values.index(str(dict["blasbatchsize"])))
@@ -5135,9 +5229,14 @@ def show_gui():
 
     def load_config_gui(): #this is used to populate the GUI with a config file, whereas load_config_cli simply overwrites cli args
         file_type = [("KoboldCpp Settings", "*.kcpps *.kcppt")]
-        global runmode_untouched
+        global runmode_untouched, zenity_permitted
         filename = zentk_askopenfilename(filetypes=file_type, defaultextension=".kcppt", initialdir=None)
         if not filename or filename=="":
+            return
+        if not os.path.exists(filename) or os.path.getsize(filename)<4 or os.path.getsize(filename)>50000000: #for sanity, check invaid kcpps
+            print("The selected config file seems to be invalid.")
+            if zenity_permitted:
+                print("You can try using the legacy filepicker instead (in Extra).")
             return
         runmode_untouched = False
         with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
@@ -6615,10 +6714,12 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         with open(os.path.join(basepath, "klite.embd"), mode='rb') as f:
             embedded_kailite = f.read()
             # patch it with extra stuff
-            origStr = "Sorry, KoboldAI Lite requires Javascript to function."
-            patchedStr = "Sorry, KoboldAI Lite requires Javascript to function.<br>You can use <a class=\"color_blueurl\" href=\"/noscript\">KoboldCpp NoScript mode</a> instead."
+            patches = [{"find":"Sorry, KoboldAI Lite requires Javascript to function.","replace":"Sorry, KoboldAI Lite requires Javascript to function.<br>You can use <a class=\"color_blueurl\" href=\"/noscript\">KoboldCpp NoScript mode</a> instead."},
+                       {"find":"var localflag = urlParams.get('local');","replace":"var localflag = true;"},
+                       {"find":"<p id=\"tempgtloadtxt\">Loading...</p>","replace":"<p id=\"tempgtloadtxt\">Loading...<br>(If load fails, try <a class=\"color_blueurl\" href=\"/noscript\">KoboldCpp NoScript mode</a> instead.)</p>"}]
             embedded_kailite = embedded_kailite.decode("UTF-8","ignore")
-            embedded_kailite = embedded_kailite.replace(origStr, patchedStr)
+            for p in patches:
+                embedded_kailite = embedded_kailite.replace(p["find"], p["replace"])
             embedded_kailite = embedded_kailite.encode()
             print("Embedded KoboldAI Lite loaded.")
     except Exception:
@@ -6745,13 +6846,17 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 lastturns.append({"role":"user","content":lastuserinput})
                 payload = {"messages":lastturns,"rep_pen":1.07,"temperature":0.8}
                 payload = transform_genparams(payload, 4) #to chat completions
-                suppress_stdout()
+                if args.debugmode < 1:
+                    suppress_stdout()
                 genout = generate(genparams=payload)
-                restore_stdout()
-                result = genout["text"]
+                if args.debugmode < 1:
+                    restore_stdout()
+                result = (genout["text"] if "text" in genout else "")
                 if result:
                     lastturns.append({"role":"assistant","content":result})
-                print(result.strip() + "\n", flush=True)
+                    print(result.strip() + "\n", flush=True)
+                else:
+                    print("(No Response Received)\n", flush=True)
         else:
             save_to_file = (args.benchmark and args.benchmark!="stdout" and args.benchmark!="")
             benchmaxctx = maxctx
@@ -6935,6 +7040,8 @@ if __name__ == '__main__':
     advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,128,2048), default=512)
     advparser.add_argument("--nobostoken", help="Prevents BOS token from being added at the start of any prompt. Usually NOT recommended for most models.", action='store_true')
     advparser.add_argument("--maxrequestsize", metavar=('[size in MB]'), help="Specify a max request payload size. Any requests to the server larger than this size will be dropped. Do not change if unsure.", type=int, default=32)
+    advparser.add_argument("--overridekv", metavar=('[name=type:value]'), help="Advanced option to override a metadata by key, same as in llama.cpp. Mainly for debugging, not intended for general use. Types: int, float, bool, str", default="")
+    advparser.add_argument("--overridetensors", metavar=('[tensor name pattern=buffer type]'), help="Advanced option to override tensor backend selection, same as in llama.cpp.", default="")
     compatgroup2 = parser.add_mutually_exclusive_group()
     compatgroup2.add_argument("--showgui", help="Always show the GUI instead of launching the model right away when loading settings from a .kcpps file.", action='store_true')
     compatgroup2.add_argument("--skiplauncher", help="Doesn't display or use the GUI launcher.", action='store_true')
@@ -6958,7 +7065,7 @@ if __name__ == '__main__':
     sdparsergroupvae.add_argument("--sdvaeauto", help="Uses a built-in VAE via TAE SD, which is very fast, and fixed bad VAEs.", action='store_true')
     sdparsergrouplora = sdparsergroup.add_mutually_exclusive_group()
     sdparsergrouplora.add_argument("--sdquant", help="If specified, loads the model quantized to save memory.", action='store_true')
-    sdparsergrouplora.add_argument("--sdlora", metavar=('[filename]'), help="Specify a stable diffusion LORA safetensors model to be applied. Cannot be used with quant models.", default="")
+    sdparsergrouplora.add_argument("--sdlora", metavar=('[filename]'), help="Specify a stable diffusion LORA safetensors model to be applied.", default="")
     sdparsergroup.add_argument("--sdloramult", metavar=('[amount]'), help="Multiplier for the LORA model to be applied.", type=float, default=1.0)
     sdparsergroup.add_argument("--sdnotile", help="Disables VAE tiling, may not work for large images.", action='store_true')
 

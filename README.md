@@ -1,6 +1,14 @@
-##### Original ([llama.cpp rocm port](https://github.com/ggerganov/llama.cpp/pull/1087), [llama.cpp commit](https://github.com/ggerganov/llama.cpp/commit/6bbc598a632560cb45dd2c51ad403bda8723b629)) by SlyEcho, YellowRoseCx, ardfork, funnbot, Engininja2, Kerfuffle, jammm, and jdecourval.
-##### Further modified and ported to KoboldCpp by YellowRoseCx.
 # koboldcpp-ROCM for AMD
+
+Further modified and ported to KoboldCpp by YellowRoseCx.
+
+KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models, inspired by the original **KoboldAI**. It's a single self-contained distributable that builds off **llama.cpp** and adds many additional powerful features.
+
+![Preview](media/preview.png)
+![Preview](media/preview2.png)
+![Preview](media/preview3.png)
+![Preview](media/preview4.png)
+
 ### Features
 - Single file executable, with no installation required and no external dependencies
 - Runs on CPU or GPU, supports full or partial offloaded
